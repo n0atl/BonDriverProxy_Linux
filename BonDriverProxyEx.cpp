@@ -1,5 +1,10 @@
 #include "BonDriverProxyEx.h"
 
+#ifdef HAVE_LIBARIBB25
+#include <getopt.h>
+static BOOL g_b25_enable = FALSE;
+#endif
+
 namespace BonDriverProxyEx {
 
 #ifdef DEBUG
@@ -51,27 +56,62 @@ static BOOL IsTagMatch(const char *line, const char *tag, char **value)
 	return TRUE;
 }
 
+static void DeleteSpace(char *dst, const char *src)
+{
+	while (*src != '\0')
+	{
+		if (*src != ' ')
+			*dst++ = *src;
+		src++;
+	} 
+	*dst = '\0';
+}
+
 static int Init(int ac, char *av[])
 {
-	if (ac < 3)
-		return -1;
-	::strncpy(g_Host, av[1], sizeof(g_Host) - 1);
-	g_Host[sizeof(g_Host) - 1] = '\0';
-	::strncpy(g_Port, av[2], sizeof(g_Port) - 1);
-	g_Port[sizeof(g_Port) - 1] = '\0';
-	if (ac > 3)
+#ifdef HAVE_LIBARIBB25
+	static const struct option options[] = {
+		{"b25",         no_argument, &g_b25_enable, TRUE},
+		{"strip",       no_argument, &B25Decoder::strip, 1},
+		{"emm",         no_argument, &B25Decoder::emm_proc, 1},
+		{"round", required_argument, NULL, 'r'},
+		{0}
+	};
+	int opt;
+
+	while ((opt = getopt_long(ac, av, "", options, NULL)) != -1)
 	{
-		g_OpenTunerRetDelay = ::atoi(av[3]);
-		if (ac > 4)
+		switch (opt)
 		{
-			g_PacketFifoSize = ::atoi(av[4]);
-			if (ac > 5)
-				g_TsPacketBufSize = ::atoi(av[5]);
+		case 0:		// long options
+			break;
+		case 'r':	// multi2 round
+			B25Decoder::multi2_round = strtoul(optarg, NULL, 10);
+			break;
+		default:
+			return -1;
+		}
+	}
+
+	if (optind > 1)
+	{
+		int i = optind, j = 1;
+		while (i < ac)
+			av[j++] = av[i++];
+		ac -= optind - 1;
+	}
+#endif
+	if (ac > 1)
+	{
+		if (*av[1] == '-')
+		{
+			if ((*(av[1] + 1) == 'h') || (*(av[1] + 1) == 'H'))
+				return -1;
 		}
 	}
 
 	FILE *fp;
-	char *p, buf[1024];
+	char *p, buf[1024], buf2[1024];
 
 #ifdef LINUX
 	ssize_t len;
@@ -98,7 +138,8 @@ static int Init(int ac, char *av[])
 	int cntD, cntT = 0, num = 0;
 	char *str, *pos, *pp[MAX_DRIVERS], **ppDriver;
 	char tag[4];
-	while (::fgets(buf, sizeof(buf), fp) && (num < MAX_DRIVERS))
+	g_ppDriver[0] = NULL;
+	while (::fgets(buf, sizeof(buf), fp))
 	{
 		if (buf[0] == ';')
 			continue;
@@ -108,57 +149,109 @@ static int Init(int ac, char *av[])
 		if (p < buf)
 			continue;
 
+		// ;OPTION
+		DeleteSpace(buf2, buf);
+		if ((::strncmp(buf2, "ADDRESS=", 8) == 0) && (::strlen(buf2) > 8))
+		{
+			::strncpy(g_Host, buf2 + 8, sizeof(g_Host) - 1);
+			g_Host[sizeof(g_Host) - 1] = '\0';
+			continue;
+		}
+		if ((::strncmp(buf2, "PORT=", 5) == 0) && (::strlen(buf2) > 5))
+		{
+			::strncpy(g_Port, buf2 + 5, sizeof(g_Port) - 1);
+			g_Port[sizeof(g_Port) - 1] = '\0';
+			continue;
+		}
+		if ((::strncmp(buf2, "OPENTUNER_RETURN_DELAY=", 23) == 0) && (::strlen(buf2) > 23))
+		{
+			g_OpenTunerRetDelay = ::atoi(buf2 + 23);
+			continue;
+		}
+		if ((::strncmp(buf2, "PACKET_FIFO_SIZE=", 17) == 0) && (::strlen(buf2) > 17))
+		{
+			g_PacketFifoSize = ::atoi(buf2 + 17);
+			continue;
+		}
+		if ((::strncmp(buf2, "TSPACKET_BUFSIZE=", 17) == 0) && (::strlen(buf2) > 17))
+		{
+			g_TsPacketBufSize = ::atoi(buf2 + 17);
+			continue;
+		}
+#ifdef HAVE_LIBARIBB25
+		if ((::strncmp(buf2, "B25=", 4) == 0) && (::strlen(buf2) > 4))
+		{
+			g_b25_enable = ::atoi(buf2 + 4);
+			continue;
+		}
+		if ((::strncmp(buf2, "STRIP=", 6) == 0) && (::strlen(buf2) > 6))
+		{
+			B25Decoder::strip = ::atoi(buf2 + 6);
+			continue;
+		}
+		if ((::strncmp(buf2, "EMM=", 4) == 0) && (::strlen(buf2) > 4))
+		{
+			B25Decoder::emm_proc = ::atoi(buf2 + 4);
+			continue;
+		}
+		if ((::strncmp(buf2, "MULTI2ROUND=", 12) == 0) && (::strlen(buf2) > 12))
+		{
+			B25Decoder::multi2_round = strtoul(buf2 + 12, NULL, 10);
+			continue;
+		}
+#endif
+
 		// ;BONDRIVER
 		// 00=PT-T;./BonDriver_LinuxPT-T0.so;./BonDriver_LinuxPT-T1.so
 		// 01=PT-S;./BonDriver_LinuxPT-S0.so;./BonDriver_LinuxPT-S1.so
-		tag[0] = (char)('0' + (num / 10));
-		tag[1] = (char)('0' + (num % 10));
-		tag[2] = '\0';
-		num++;
-		if (IsTagMatch(buf, tag, &p))
+		if (num < MAX_DRIVERS)
 		{
-			// format: GroupName;BonDriver1;BonDriver2;BonDriver3...
-			// e.g.  : PT-T;./BonDriver_LinuxPT-T0.so;./BonDriver_LinuxPT-T1.so
-			str = new char[::strlen(p) + 1];
-			::strcpy(str, p);
-			pos = pp[0] = str;
-			cntD = 1;
-			for (;;)
+			tag[0] = (char)('0' + (num / 10));
+			tag[1] = (char)('0' + (num % 10));
+			tag[2] = '\0';
+			num++;
+			if (IsTagMatch(buf, tag, &p))
 			{
-				p = ::strchr(pos, ';');
-				if (p)
+				// format: GroupName;BonDriver1;BonDriver2;BonDriver3...
+				// e.g.  : PT-T;./BonDriver_LinuxPT-T0.so;./BonDriver_LinuxPT-T1.so
+				str = new char[::strlen(p) + 1];
+				::strcpy(str, p);
+				pos = pp[0] = str;
+				cntD = 1;
+				for (;;)
 				{
-					*p = '\0';
-					pos = pp[cntD++] = p + 1;
-					if (cntD > (MAX_DRIVERS - 1))
+					p = ::strchr(pos, ';');
+					if (p)
+					{
+						*p = '\0';
+						pos = pp[cntD++] = p + 1;
+						if (cntD > (MAX_DRIVERS - 1))
+							break;
+					}
+					else
 						break;
 				}
-				else
-					break;
+				if (cntD == 1)
+				{
+					delete[] str;
+					continue;
+				}
+				ppDriver = g_ppDriver[cntT++] = new char *[cntD];
+				::memcpy(ppDriver, pp, sizeof(char *) * cntD);
+				std::vector<stDriver> vstDriver(cntD - 1);
+				for (int i = 1; i < cntD; i++)
+				{
+					vstDriver[i-1].strBonDriver = ppDriver[i];
+					vstDriver[i-1].hModule = NULL;
+					vstDriver[i-1].bUsed = FALSE;
+				}
+				DriversMap[ppDriver[0]] = vstDriver;
 			}
-			if (cntD == 1)
-			{
-				delete[] str;
-				continue;
-			}
-			ppDriver = g_ppDriver[cntT++] = new char *[cntD];
-			::memcpy(ppDriver, pp, sizeof(char *) * cntD);
-			std::vector<stDriver> vstDriver(cntD - 1);
-			for (int i = 1; i < cntD; i++)
-			{
-				vstDriver[i-1].strBonDriver = ppDriver[i];
-				vstDriver[i-1].hModule = NULL;
-				vstDriver[i-1].bUsed = FALSE;
-			}
-			DriversMap[ppDriver[0]] = vstDriver;
-		}
-		else
-		{
-			g_ppDriver[cntT] = NULL;
-			break;
 		}
 	}
 	::fclose(fp);
+	if (cntT < MAX_DRIVERS)
+		g_ppDriver[cntT] = NULL;
 
 #ifdef DEBUG
 	for (int i = 0; i < MAX_DRIVERS; i++)
@@ -171,6 +264,26 @@ static int Init(int ac, char *av[])
 			::fprintf(stderr, "  : %s\n", v[j].strBonDriver);
 	}
 #endif
+
+	switch (ac)
+	{
+		case 6:
+			g_TsPacketBufSize = ::atoi(av[5]);
+		case 5:
+			g_PacketFifoSize = ::atoi(av[4]);
+		case 4:
+			g_OpenTunerRetDelay = ::atoi(av[3]);
+		case 3:
+			::strncpy(g_Port, av[2], sizeof(g_Port) - 1);
+			g_Port[sizeof(g_Port) - 1] = '\0';
+		case 2:
+			::strncpy(g_Host, av[1], sizeof(g_Host) - 1);
+			g_Host[sizeof(g_Host) - 1] = '\0';
+		case 1:
+			break;
+		default:
+			return -1;
+	}
 
 	return 0;
 }
@@ -488,7 +601,7 @@ DWORD cProxyServerEx::Process()
 			{
 				if (pPh->GetBodyLength() != sizeof(DWORD))
 				{
-					TCHAR c = 0;
+					WCHAR c = 0;
 					makePacket(eEnumTuningSpace, &c);
 				}
 				else
@@ -499,7 +612,7 @@ DWORD cProxyServerEx::Process()
 						makePacket(eEnumTuningSpace, p);
 					else
 					{
-						TCHAR c = 0;
+						WCHAR c = 0;
 						makePacket(eEnumTuningSpace, &c);
 					}
 				}
@@ -510,7 +623,7 @@ DWORD cProxyServerEx::Process()
 			{
 				if (pPh->GetBodyLength() != (sizeof(DWORD) * 2))
 				{
-					TCHAR c = 0;
+					WCHAR c = 0;
 					makePacket(eEnumChannelName, &c);
 				}
 				else
@@ -522,7 +635,7 @@ DWORD cProxyServerEx::Process()
 						makePacket(eEnumChannelName, p);
 					else
 					{
-						TCHAR c = 0;
+						WCHAR c = 0;
 						makePacket(eEnumChannelName, &c);
 					}
 				}
@@ -893,6 +1006,10 @@ DWORD cProxyServerEx::Process()
 									m_pTsReaderArg = new stTsReaderArg();
 									m_pTsReaderArg->TsReceiversList.push_back(this);
 									m_pTsReaderArg->pIBon = m_pIBon;
+#ifdef HAVE_LIBARIBB25
+									if (g_b25_enable)
+										m_pTsReaderArg->b25.init();
+#endif
 									if (::pthread_create(&m_hTsRead, NULL, cProxyServerEx::TsReader, m_pTsReaderArg))
 									{
 										m_hTsRead = 0;
@@ -1272,12 +1389,24 @@ void *cProxyServerEx::TsReader(LPVOID pv)
 			now = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
 			if (((now - before) >= 1000) || ChannelChanged)
 			{
+#ifdef HAVE_LIBARIBB25
+				if (ChannelChanged)
+					pArg->b25.reset();
+#endif
 				fSignalLevel = pIBon->GetSignalLevel();
 				before = now;
 				ChannelChanged = FALSE;
 			}
 			if (pIBon->GetTsStream(&pBuf, &dwSize, &dwRemain) && (dwSize != 0))
 			{
+#ifdef HAVE_LIBARIBB25
+				if (g_b25_enable)
+				{
+					pArg->b25.decode(pBuf, dwSize, &pBuf, &dwSize);
+					if (dwSize == 0)
+						goto next;
+				}
+#endif
 				if ((pos + dwSize) < TsPacketBufSize)
 				{
 					::memcpy(&pTsBuf[pos], pBuf, dwSize);
@@ -1319,6 +1448,9 @@ void *cProxyServerEx::TsReader(LPVOID pv)
 				}
 			}
 		}
+#ifdef HAVE_LIBARIBB25
+	next:
+#endif
 		if (dwRemain == 0)
 			::nanosleep(&ts, NULL);
 	}
@@ -1809,7 +1941,12 @@ int main(int argc, char *argv[])
 {
 	if (BonDriverProxyEx::Init(argc, argv) != 0)
 	{
+#ifdef HAVE_LIBARIBB25
+		fprintf(stderr, "usage: %s [--b25 [--strip] [--emm] [--round N]] "
+				"address port (opentuner_return_delay_time packet_fifo_size tspacket_bufsize)\ne.g. $ %s 192.168.0.100 1192\n", argv[0],argv[0]);
+#else
 		fprintf(stderr, "usage: %s address port (opentuner_return_delay_time packet_fifo_size tspacket_bufsize)\ne.g. $ %s 192.168.0.100 1192\n", argv[0],argv[0]);
+#endif
 		return 0;
 	}
 
